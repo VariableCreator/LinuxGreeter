@@ -1,0 +1,71 @@
+module oidc_session 1.0;
+
+require {
+    type xdm_t;
+    type etc_t;
+    type passwd_file_t;
+    type shadow_t;
+    type home_root_t;
+    type user_home_dir_t;
+    type user_home_t;
+    type cache_home_t;
+    type etc_runtime_t;
+    type mail_spool_t;
+    class dir { add_name remove_name rename write read getattr search open create setattr };
+    class file { create open read write rename unlink getattr setattr append lock ioctl map link };
+    class lnk_file { create unlink read };
+    class passwd { passwd chfn chsh crontab rootok };
+}
+
+# --- HM-Anmeldung (oidc-login) unter Fedora/RHEL: der SDDM-Greeter (User sddm,
+#     SELinux-Domain xdm_t) erzeugt temporaere Session-Konten via useradd,
+#     setzt deren Passwort via chpasswd und loescht sie via userdel wieder.
+#     sudo gibt zwar uid 0, behaelt aber die Domain xdm_t, weshalb shadow-utils
+#     ohne dieses Modul scheitern (u.a. "useradd: cannot lock /etc/passwd").
+#
+#     Erlaubt ist ausschliesslich Account-Verwaltung (Datenbanken, /etc-Sperr-/
+#     Temp-Dateien, /etc/skel, Home-Verzeichnisse, Mail-Spool, "passwd"-Recht).
+#     Die so erzeugten Konten sind temporaer (PAM-Logout-Hook + Xsetup-Boot-
+#     Cleanup) und stehen nur in /etc/oidc-login/session-accounts. ---
+
+# /etc-Temp-Dateien von useradd (passwd.XXXX, group.XXXX ... landen als etc_t)
+allow xdm_t etc_t:dir { add_name remove_name rename write read getattr search open };
+allow xdm_t etc_t:file { create open read write rename unlink getattr setattr append lock ioctl map link };
+
+# Account-Datenbanken (passwd/group/shadow/gshadow + Lock-Dateien)
+allow xdm_t passwd_file_t:dir { add_name remove_name rename write read getattr search open };
+allow xdm_t passwd_file_t:file { create open read write rename unlink getattr setattr append lock ioctl map link };
+allow xdm_t shadow_t:dir { add_name remove_name rename write read getattr search open };
+allow xdm_t shadow_t:file { create open read write rename unlink getattr setattr append lock ioctl map link };
+
+# /etc/skel lesen (useradd -m kopiert das Skelett)
+allow xdm_t etc_runtime_t:file { read open getattr ioctl map };
+allow xdm_t etc_runtime_t:dir { read getattr search open };
+allow xdm_t etc_runtime_t:lnk_file { read };
+
+# Home-Verzeichnis anlegen/loeschen (useradd -m, userdel -r)
+allow xdm_t home_root_t:dir { add_name create write getattr search open };
+allow xdm_t user_home_dir_t:dir { create add_name remove_name rename write read getattr search open };
+allow xdm_t user_home_dir_t:file { create open read write rename unlink getattr setattr lock ioctl map };
+allow xdm_t user_home_t:dir { create add_name remove_name rename write read getattr search open };
+allow xdm_t user_home_t:file { create open read write rename unlink getattr setattr lock ioctl map };
+allow xdm_t user_home_t:lnk_file { create unlink read };
+
+# ~/.cache traegt auf Fedora/RHEL die eigene Klasse cache_home_t. Dort legt der
+# Greeter nach der Konto-Erstellung die Spool-Cookies des HM-SSO ab
+# (~/.cache/oidc-login/sso-cookies/, je Cookie eine Datei, siehe
+# session-account/oidc-session-account und sso-cookie/oidc-sso-cookie). Ohne
+# diese Regeln scheitert das mkdir still, und
+# der Firefox des Benutzers bekommt den Cookie nicht (kein Fehler im Login, nur
+# eine zusaetzliche 2FA auf dem Desktop). Zugriff nur auf Cache-Daten des
+# jeweiligen Homes, nichts darueber hinaus.
+allow xdm_t cache_home_t:dir { add_name remove_name write read getattr search open create setattr };
+allow xdm_t cache_home_t:file { create open read write getattr setattr lock ioctl map unlink };
+
+# Rechte fuer selinux_check_access: chpasswd prueft die "passwd"-Berechtigung
+# fuer sich selbst und beendet sich wortlos mit RC=1 ohne sie.
+allow xdm_t self:passwd passwd;
+
+# Mailbox anlegen (useradd erzeugt /var/mail/<user>)
+allow xdm_t mail_spool_t:dir { add_name create write read getattr search open };
+allow xdm_t mail_spool_t:file { create open read write append getattr setattr lock ioctl map };

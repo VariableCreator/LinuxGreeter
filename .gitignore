@@ -1,0 +1,19 @@
+# Build artifacts
+oidc-login/build/
+greeter-process/build/
+*.o
+*.so
+*.moc
+moc_*.cpp
+qrc_*.cpp
+Makefile*
+
+# Built binary (produced by the oidc-login build; copied here by installer tooling)
+oidc-login/installer/packages/edu.hm.oidc-login/data/oidc-login
+
+# Backup of the former nested git repo (oidc-login GitLab clone)
+oidc-login/.git.bak/
+
+# Python-Caches
+__pycache__/
+*.py[cod]

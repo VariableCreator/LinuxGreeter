@@ -1,0 +1,6 @@
+<RCC>
+    <qresource prefix="/">
+        <file>capture/qwebchannel.js</file>
+        <file>capture/credential-capture.js</file>
+    </qresource>
+</RCC>

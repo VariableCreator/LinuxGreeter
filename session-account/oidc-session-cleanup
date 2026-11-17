@@ -1,0 +1,54 @@
+#!/bin/sh
+# oidc-session-cleanup
+#
+# pam_exec wrapper: deletes the temporary session account on logout.
+# Called from the SDDM PAM services (install.sh registers the
+# hook in /etc/pam.d/sddm AND /etc/pam.d/sddm-autologin - depending on
+# which service SDDM used to open the session):
+#   session optional pam_exec.so /usr/local/sbin/oidc-session-cleanup
+#
+# pam_exec sets PAM_TYPE (open_session/close_session),
+# PAM_USER and PAM_SERVICE. close_session runs on a normal logout
+# - not on lock-screen unlocks (those do not go through
+# the sddm PAM service).
+#
+# Silent by design: no log file, stdout/stderr discarded so logout
+# is never blocked. State check: /etc/oidc-login/session-accounts
+# + 'id <user>' (gone = success).
+
+# --- Central config -----------------------------------------------------------
+# oidc-login.conf is the SINGLE source of truth: no default values are
+# hard-coded here. Precedence is env > file, exactly like the other helpers.
+# The file is only PARSED (flat KEY=VALUE), never sourced/eval'd - it is
+# root-readable data, and running as root we do not execute it.
+OIDC_CONF_FILE="${OIDC_CONFIG:-/etc/oidc-login/oidc-login.conf}"
+
+conf_value() {
+    # Print the value of $1: env (already set, even empty) wins over the file.
+    _key="$1"
+    eval "_env_set=\${$_key+set}"
+    if [ "${_env_set:-}" = "set" ]; then
+        eval "printf '%s' \"\$$_key\""
+        return 0
+    fi
+    [ -f "$OIDC_CONF_FILE" ] || return 0
+    _val="$(sed -n -e "s/^[[:space:]]*${_key}[[:space:]]*=[[:space:]]*//p" \
+        "$OIDC_CONF_FILE" 2>/dev/null | tail -n 1 | tr -d '\r')"
+    # strip matching quotes (values with spaces)
+    case "$_val" in
+        \"*\") _val="${_val#\"}"; _val="${_val%\"}" ;;
+        \'*\') _val="${_val#\'}"; _val="${_val%\'}" ;;
+    esac
+    printf '%s' "$_val"
+}
+
+ACCOUNTS_FILE="$(conf_value OIDC_ACCOUNTS_FILE)"
+SESSION_ACCOUNT_BIN="$(conf_value OIDC_SESSION_ACCOUNT)"
+
+if [ "$PAM_TYPE" = "close_session" ] && [ -n "$PAM_USER" ] && [ "$PAM_USER" != "root" ]; then
+    if grep -qx "$PAM_USER" "$ACCOUNTS_FILE" 2>/dev/null; then
+        "$SESSION_ACCOUNT_BIN" delete-user-auto "$PAM_USER" >/dev/null 2>&1 || true
+    fi
+    exit 0
+fi
+exit 0

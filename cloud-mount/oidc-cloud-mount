@@ -1,0 +1,599 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+oidc-cloud-mount: map LRZ cloud storage (WebDAV) as a network drive.
+
+URL : https://webdisk.ads.mwn.de/hcwebdav (auth ADS\\<id> + password).
+LRZ name = "hm-<HM login>", same password (e.g. tester->hm-tester).
+
+Invocation as user (autostart): oidc-cloud-mount [--timeout=N] [--wait=N].
+Password only goes via MountOperation to GVFS.
+Env: OIDC_CLOUD_URL / OIDC_CLOUD_TIMEOUT /
+OIDC_CLOUD_LINK / OIDC_CLOUD_WAIT / OIDC_CLOUD_CONNECT_TIMEOUT.
+"""
+import base64
+import os
+import socket
+import sys
+import time
+
+# Central config: /etc/oidc-login/oidc-login.conf (override via OIDC_CONFIG).
+# Module-level values below are DEFAULTS; refresh_config() re-reads env
+# (after load) so tests / config edits always take effect on next call.
+sys.path.insert(0, "/etc/oidc-login")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "..", "config"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from oidc_config import load_config as _oidc_load_config
+    _oidc_load_config()
+except Exception:
+    pass
+
+
+# Integer value from the central config (env > file); 0 when unset.
+def _int_env(name):
+    """Integer value from the central config (env > file); 0 when unset.
+
+    No default is duplicated here on purpose: oidc-login.conf owns the
+    values, the code only reads them.
+    """
+    try:
+        return int(os.environ.get(name, "") or 0)
+    except ValueError:
+        return 0
+
+
+# Boolean value from the central config (env > file); False when unset.
+def _bool_env(name):
+    """Boolean value from the central config (env > file); False when unset.
+
+    Accepted as true: 1, true, yes, on (case-insensitive). Everything else -
+    including an unset value - is False, so a missing key never enables an
+    extra home entry by accident.
+    """
+    value = (os.environ.get(name, "") or "").strip().lower()
+    return value in ("1", "true", "yes", "on")
+
+
+CLOUD_VERSION = "8"
+# How often the GVFS daemon may ask for credentials before we
+# abort (wrong password -> fail-soft instead of an endless loop).
+MOUNT_MAX_ASKS = 3
+# Poll interval (seconds) between reachability attempts. The total wait
+# comes from OIDC_CLOUD_WAIT/--wait; only this stride is a code constant.
+WAIT_POLL = 5
+
+# All values below are read from the central config (env > file).
+CLOUD_HOST = ""
+CLOUD_PATH = ""
+CLOUD_URL_DEFAULT = ""
+CLOUD_DOMAIN = ""
+SPOOL_REL = ""
+LINK_DEFAULT = ""
+SYMLINK_DEFAULT = True
+WAIT_TOTAL_DEFAULT = 0
+
+
+# (Re-)read central config + env into module globals.
+def refresh_config():
+    """(Re-)read central config + env into module globals.
+
+    Every value comes from oidc-login.conf (or the environment); the code
+    keeps NO duplicate defaults.
+    """
+    global CLOUD_HOST, CLOUD_PATH, CLOUD_URL_DEFAULT, CLOUD_DOMAIN
+    global SPOOL_REL, LINK_DEFAULT, SYMLINK_DEFAULT
+    global WAIT_TOTAL_DEFAULT
+    try:
+        _oidc_load_config()
+    except Exception:
+        pass
+    CLOUD_HOST = os.environ.get("OIDC_CLOUD_HOST", "")
+    CLOUD_PATH = os.environ.get("OIDC_CLOUD_PATH", "")
+    CLOUD_URL_DEFAULT = (os.environ.get("OIDC_CLOUD_URL")
+                         or ("https://%s%s" % (CLOUD_HOST, CLOUD_PATH)))
+    CLOUD_DOMAIN = os.environ.get("OIDC_CLOUD_DOMAIN", "")
+    SPOOL_REL = os.environ.get("OIDC_CLOUD_SPOOL_REL", "").replace("/", os.sep)
+    LINK_DEFAULT = os.environ.get("OIDC_CLOUD_LINK", "")
+    # Env > file > module default: only override when the key is actually set
+    # in the environment (load_config exported it from oidc-login.conf, or a
+    # test set it explicitly). Otherwise keep the module-level default so a
+    # config-less run still behaves sensibly.
+    if "OIDC_CLOUD_SYMLINK" in os.environ:
+        SYMLINK_DEFAULT = _bool_env("OIDC_CLOUD_SYMLINK")
+    WAIT_TOTAL_DEFAULT = _int_env("OIDC_CLOUD_WAIT")
+
+
+refresh_config()
+
+# Path of the cloud-storage spool in the home ('' if not configured).
+def spool_path():
+    """Path of the cloud-storage spool in the home ('' if not configured)."""
+    if not SPOOL_REL:
+        return ""
+    return os.path.join(os.path.expanduser("~"), SPOOL_REL)
+
+
+# Read user_b64/pass_b64/lrz_user from the spool file. Return (lrz_user, password).
+def read_spool(path):
+    """Read user_b64/pass_b64/lrz_user. Return (lrz_user, password)."""
+    data = {}
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.rstrip("\n")
+            if not line or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            data[key.strip()] = value.strip()
+    user_b64 = data.get("user_b64", "")
+    pass_b64 = data.get("pass_b64", "")
+    lrz_user = data.get("lrz_user", "")
+    password = ""
+    if pass_b64:
+        try:
+            password = base64.b64decode(pass_b64).decode("utf-8", "replace")
+        except Exception:
+            password = ""
+    login = ""
+    if user_b64:
+        try:
+            login = base64.b64decode(user_b64).decode("utf-8", "replace")
+        except Exception:
+            login = ""
+    if not lrz_user and login:
+        lrz_user = map_lrz_user(login)
+    return lrz_user, password
+
+
+# HM login -> LRZ name ("tester" -> "hm-tester").
+def map_lrz_user(hm_login):
+    """HM login -> LRZ name ("tester" -> "hm-tester")."""
+    name = (hm_login or "").strip().lower()
+    if "@" in name:
+        name = name.split("@", 1)[0]
+    cleaned = "".join(c if (c.isalnum() or c in "._-") else "_" for c in name)
+    while cleaned and cleaned[0].isdigit():
+        cleaned = cleaned[1:]
+    if not cleaned:
+        return "hmuser"
+    cleaned = cleaned[:32]
+    if cleaned.startswith("hm-"):
+        return cleaned
+    return ("hm-" + cleaned)[:32]
+
+
+# TCP connect timeout in seconds (via OIDC_CLOUD_CONNECT_TIMEOUT).
+def connect_timeout():
+    """TCP connect timeout in seconds (via OIDC_CLOUD_CONNECT_TIMEOUT)."""
+    return _int_env("OIDC_CLOUD_CONNECT_TIMEOUT")
+
+
+# Try opening a TCP connection to host:port within timeout seconds.
+def server_reachable(host=CLOUD_HOST, port=443, timeout=None):
+    if timeout is None:
+        timeout = connect_timeout()
+    try:
+        socket.create_connection((host, port), timeout=timeout).close()
+        return True
+    except OSError:
+        return False
+
+
+# Wait until the server is reachable (slow network at login), retrying
+# every poll seconds up to total seconds (fail-soft: exit 2 after expiry).
+def wait_for_server(host=CLOUD_HOST, port=443, total=WAIT_TOTAL_DEFAULT,
+                    poll=WAIT_POLL, timeout=None):
+    """Wait until the server is reachable (slow network at login).
+
+    At session start the HM network is often not ready yet. Previously ONE
+    connect attempt with 5 s was enough - if it failed, the network drive
+    stayed off completely. Now we wait up to 'total' seconds and retry every
+    'poll' seconds (fail-soft: exit 2 after expiry).
+    """
+    if timeout is None:
+        timeout = connect_timeout()
+    total = max(0, total)
+    poll = max(1, poll)
+    deadline = time.time() + total
+    while True:
+        if server_reachable(host, port, timeout):
+            return True
+        if time.time() >= deadline:
+            return False
+        time.sleep(poll)
+        
+# Ask the GIO mount list (gvfsd): is a dav mount on our host currently
+# active? Fail-soft: without gi/daemon simply False (no phantom).
+def gio_reports_mount(host=CLOUD_HOST):
+    # Ask the GIO mount list (gvfsd): is a dav mount on our
+    # host mounted - independent of the FUSE directory? True/False.
+    # Fail-soft: without gi/daemon simply False (no phantom).
+    try:
+        import gi
+        gi.require_version("Gio", "2.0")
+        from gi.repository import Gio
+        for mount in Gio.VolumeMonitor.get().get_mounts():
+            try:
+                root = mount.get_root()
+                uri = root.get_uri() if root else ""
+            except Exception:
+                uri = ""
+            try:
+                name = mount.get_name() or ""
+            except Exception:
+                name = ""
+            if "dav" in (uri + name) and host in (uri + name):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+# Find the local gvfs path of the mount. Return: (path, mounted).
+# 'mounted' is True ONLY for a REAL dav mount on CLOUD_HOST.
+def gvfs_path_for(url_or_prefix, uid=None):
+    # Find the local gvfs path of the mount. Return: (path, mounted).
+    # 'mounted' is True ONLY for a REAL dav mount on CLOUD_HOST
+    # (FUSE directory OR GIO mount list). Otherwise the
+    # "already mounted" phantom arose: the path string was returned
+    # although no dav mount existed at all, and the symlink pointed nowhere.
+    mounted = gio_reports_mount()
+    if uid is None:
+        try:
+            uid = os.getuid()
+        except Exception:
+            pass
+    if uid is not None:
+        base = "/run/user/%d/gvfs" % uid
+    else:
+        base = os.environ.get("XDG_RUNTIME_DIR", "") + "/gvfs"
+    try:
+        entries = sorted(os.listdir(base))
+    except OSError:
+        if mounted:
+            return "", True
+        return None, False
+    for entry in entries:
+        if CLOUD_HOST not in entry:
+            continue
+        full = os.path.join(base, entry)
+        if not os.path.isdir(full):
+            continue
+        if entry.startswith("dav:host="):
+            return full, True
+        # The WebDAV base path from the config (e.g. "/hcwebdav" -> "hcwebdav").
+        sub = CLOUD_PATH.strip("/")
+        if sub and os.path.isdir(os.path.join(full, sub)):
+            return os.path.join(full, sub), True
+        return full, True
+    if mounted:
+        return "", True
+    return None, False
+
+
+# Normalize the WebDAV URL to a davs:// URI for Gio.
+def url_to_davs_uri(url):
+    """Normalize the WebDAV URL to a davs:// URI for Gio."""
+    u = (url or "").strip() or CLOUD_URL_DEFAULT
+    if u.startswith("https://"):
+        u = "davs://" + u[len("https://"):]
+    elif u.startswith("http://"):
+        u = "dav://" + u[len("http://"):]
+    return u
+
+
+# Mount via Gio+MountOperation. Return: (ok, path|None, error).
+def mount_via_gio(url, username, password, timeout):
+    """Mount via Gio+MountOperation. Return: (ok, path|None, error).
+
+    IMPORTANT: even with user/password preset, the GVFS daemon asks back
+    via the "ask-password" signal (and possibly "ask-question"). If they
+    are not answered, the mount hangs -> timeout. So we answer them here
+    with reply(HANDLED) and supply the credentials again. After
+    MOUNT_MAX_ASKS attempts we abort (wrong password -> fail-soft instead
+    of an endless loop).
+    """
+    try:
+        import gi
+        gi.require_version("Gio", "2.0")
+        from gi.repository import Gio, GLib
+    except Exception as exc:
+        return False, None, "no Gio (python3-gi missing?): %s" % exc
+
+    try:
+        location = Gio.File.new_for_uri(url_to_davs_uri(url))
+    except Exception as exc:
+        return False, None, "invalid URL %r: %s" % (url, exc)
+
+    op = Gio.MountOperation.new()
+    try:
+        op.set_domain(CLOUD_DOMAIN)
+    except Exception:
+        pass
+    op.set_username(username)
+    op.set_password(password)
+    try:
+        op.set_password_save(Gio.PasswordSave.NEVER)
+    except Exception:
+        pass
+    # Count the daemon's follow-up questions (ask-password + ask-question).
+    state = {"asks": 0, "pw_set": []}
+
+    # Answer ask-password follow-up questions from the GVFS daemon.
+    def answer_operation(op_obj, message=None, user=None, domain=None,
+                         flags=None, *extra):
+        # Signature of GMountOperation::ask-password:
+        #   (op, message, user, domain, flags)
+        # PyGObject passes ALL filler arguments - hence *extra.
+        # IMPORTANT: 'flags' says what the daemon needs (NEED_PASSWORD etc.).
+        # We supply domain/user/password again and answer HANDLED.
+        state["asks"] += 1
+        if state["asks"] > MOUNT_MAX_ASKS:
+            try:
+                op_obj.reply(Gio.MountOperationResult.ABORTED)
+            except Exception:
+                pass
+            return
+        try:
+            op_obj.set_domain(CLOUD_DOMAIN)
+        except Exception:
+            pass
+        op_obj.set_username(username)
+        op_obj.set_password(password)
+        state["pw_set"].append(True)
+        try:
+            op_obj.set_password_save(Gio.PasswordSave.NEVER)
+        except Exception:
+            pass
+        try:
+            op_obj.reply(Gio.MountOperationResult.HANDLED)
+        except Exception:
+            pass
+
+    # Answer ask-question (certificate/redirect) from the GVFS daemon.
+    def on_ask_question(op_obj, message=None, choices=None, *extra):
+        # Certificate/redirect questions: pick the first option = "continue".
+        state["asks"] += 1
+        if state["asks"] > MOUNT_MAX_ASKS:
+            try:
+                op_obj.reply(Gio.MountOperationResult.ABORTED)
+            except Exception:
+                pass
+            return
+        try:
+            op_obj.set_choice(0)
+        except Exception:
+            pass
+        try:
+            op_obj.reply(Gio.MountOperationResult.HANDLED)
+        except Exception:
+            pass
+
+    try:
+        op.connect("ask-password", answer_operation)
+    except Exception:
+        pass
+    try:
+        op.connect("ask-question", on_ask_question)
+    except Exception:
+        pass
+
+    result = {}
+    loop = GLib.MainLoop()
+
+    # Callback when the mount operation finishes.
+    def on_done(obj, res, _data):
+        try:
+            ok = obj.mount_enclosing_volume_finish(res)
+            result["ok"] = bool(ok)
+            result["err"] = ""
+            if result["ok"] and state["asks"] > MOUNT_MAX_ASKS:
+                result["ok"] = False
+                result["err"] = "credentials rejected (%d follow-up questions)" \
+                    % state["asks"]
+        except Exception as exc:
+            # "already mounted" is NOT an error: a daemon/old mount already
+            # has the URI (e.g. parallel autostart run or leftover of an
+            # earlier session). Then the goal is reached.
+            text = str(exc) or exc.__class__.__name__
+            if "already mounted" in text.lower():
+                result["ok"] = True
+                result["err"] = ""
+            else:
+                result["ok"] = False
+                result["err"] = text
+        loop.quit()
+
+    # Timeout handler: fail the mount if it took too long.
+    def on_timeout():
+        if "ok" not in result:
+            result["ok"] = False
+            result["err"] = "timeout after %d s" % timeout
+            try:
+                cancellable.cancel()
+            except Exception:
+                pass
+            loop.quit()
+        return False
+
+    try:
+        cancellable = Gio.Cancellable.new()
+        location.mount_enclosing_volume(Gio.MountMountFlags.NONE, op,
+                                        cancellable, on_done, None)
+        GLib.timeout_add_seconds(timeout, on_timeout)
+        loop.run()
+    except Exception as exc:
+        return False, None, "mount call failed: %s" % exc
+
+    if not result.get("ok"):
+        return False, None, result.get("err", "unknown mount error")
+
+    fresh_path, fresh_mounted = gvfs_path_for(url)
+    if not fresh_mounted:
+        try:
+            time.sleep(1)
+            fresh_path, fresh_mounted = gvfs_path_for(url)
+        except Exception:
+            fresh_path, fresh_mounted = None, False
+    path = fresh_path if fresh_mounted else None
+    if path is None:
+        try:
+            mount = location.find_enclosing_mount()
+            path = mount.get_root().get_path()
+        except Exception:
+            path = None
+    return True, path, ""
+
+# Create/repair a user-configured symlink (OIDC_CLOUD_LINK) to the mount target.
+def ensure_symlink(target):
+    link_name = os.environ.get("OIDC_CLOUD_LINK") or LINK_DEFAULT
+    if not link_name:
+        return None  # no link name configured (OIDC_CLOUD_LINK)
+    if not (_bool_env("OIDC_CLOUD_SYMLINK") or SYMLINK_DEFAULT):
+        return None  # OIDC_CLOUD_SYMLINK=false: no symlink
+    link = os.path.join(os.path.expanduser("~"), link_name)
+    try:
+        if os.path.islink(link) or os.path.exists(link):
+            if os.path.islink(link) and os.readlink(link) == target:
+                return link  # already correct
+            if os.path.islink(link):
+                os.unlink(link)
+            else:
+                return None  # real file/dir with that name: leave it alone
+        os.symlink(target, link)
+        return link
+    except OSError:
+        return None
+
+
+# Does this symlink point into a GVFS runtime directory (i.e. is it ours)?
+def _points_into_gvfs(target):
+    """Is 'target' a path inside a GVFS runtime directory (i.e. ours)?"""
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "")
+    roots = ["/run/user/", "/.gvfs/"]
+    if runtime:
+        roots.append(runtime.rstrip("/") + "/gvfs/")
+    return any(root in target for root in roots)
+
+
+# Remove the symlink if it is stale or the symlink is switched off.
+def remove_stale_symlink():
+    """Remove the symlink if it is stale or the symlink is switched off.
+
+    Two cases:
+    1. OIDC_CLOUD_SYMLINK=true: only a broken symlink (no mount) is removed.
+    2. OIDC_CLOUD_SYMLINK=false: a leftover ~/Cloud-Storage from an older
+       installation is removed - it is the entry that makes Thunar spin
+       forever on Xubuntu (local path inside the gvfs FUSE mount).
+    """
+    link_name = os.environ.get("OIDC_CLOUD_LINK") or LINK_DEFAULT
+    if not link_name:
+        return
+    link = os.path.join(os.path.expanduser("~"), link_name)
+    if not os.path.islink(link):
+        return  # nothing of ours (a real file/dir stays untouched)
+    try:
+        if _bool_env("OIDC_CLOUD_SYMLINK") or SYMLINK_DEFAULT:
+            if not os.path.exists(link):
+                os.unlink(link)  # broken: no mount behind it
+        elif _points_into_gvfs(os.readlink(link)):
+            os.unlink(link)  # switched off: drop the gvfs link
+    except OSError:
+        pass
+
+# Read mount timeout from env (OIDC_CLOUD_TIMEOUT) or --timeout=N CLI flag.
+def parse_timeout(argv):
+    timeout = _int_env("OIDC_CLOUD_TIMEOUT")
+    for flag in argv:
+        if flag.startswith("--timeout"):
+            if "=" in flag:
+                try:
+                    timeout = int(flag.split("=", 1)[1])
+                except ValueError:
+                    pass
+    return timeout
+
+# Wait time (seconds) for the network: OIDC_CLOUD_WAIT or --wait=N.
+def parse_wait(argv):
+    """Wait time (seconds) for the network: OIDC_CLOUD_WAIT or --wait=N."""
+    wait = _int_env("OIDC_CLOUD_WAIT")
+    for flag in argv:
+        if flag.startswith("--wait"):
+            if "=" in flag:
+                try:
+                    wait = int(flag.split("=", 1)[1])
+                except ValueError:
+                    pass
+    if wait < 0:
+        wait = WAIT_TOTAL_DEFAULT
+    return wait
+
+# Create the configured home entry (symlink) after a mount.
+def ensure_entries(gvfs_path):
+    """Create the configured home entry (symlink).
+
+    The symlink is created when OIDC_CLOUD_SYMLINK is true (default, works
+    in GNOME Files/Nautilus on Debian). When switched off (Xubuntu/Thunar,
+    where the gvfs FUSE path hangs in \"Loading folder contents...\"), no
+    symlink is created and any leftover is cleaned up.
+    """
+    if gvfs_path and ensure_symlink(gvfs_path):
+        return
+    # Symlink switched off (OIDC_CLOUD_SYMLINK=false) or no local target:
+    # drop a leftover from an older installation, it is the entry that keeps
+    # Thunar spinning ("Loading folder contents...").
+    remove_stale_symlink()
+
+
+# Remove both home entries again if there is no mount (fail-soft).
+def remove_stale_entries():
+    """Remove the symlink again if there is no mount (fail-soft)."""
+    remove_stale_symlink()
+
+
+# Entry point: parse args, wait for network, mount via GVFS, set up home entry.
+def main(argv):
+    if "--help" in argv or "-h" in argv:
+        print("oidc-cloud-mount [--timeout=N] [--wait=N]")
+        print("Map LRZ cloud storage (WebDAV) via Gio/GVFS. Silent: "
+              "exit 2 = no mount, session keeps running.")
+        return 0
+    spool = spool_path()
+
+    if not spool or not os.path.exists(spool):
+        return 1
+    try:
+        lrz_user, password = read_spool(spool)
+    except Exception:
+        return 2
+    if not lrz_user or not password:
+        return 2
+
+    existing, t_mounted = gvfs_path_for("")
+    if t_mounted and existing:
+        ensure_entries(existing)
+        return 0
+
+    wait = parse_wait(argv)
+    if not wait_for_server(total=wait):
+        remove_stale_entries()
+        return 2
+
+    timeout = parse_timeout(argv)
+    # Missing DAV backend / gvfsd-fuse are not fatal here: the mount is still
+    # attempted, it just cannot produce a local folder (fail-soft, exit 2 if
+    # that is what happens).
+    url = os.environ.get("OIDC_CLOUD_URL") or CLOUD_URL_DEFAULT
+    ok, gvfs_path, _err = mount_via_gio(url, lrz_user, password, timeout)
+    password = "x" * len(password)
+    del password
+    if not ok:
+        remove_stale_entries()
+        return 2
+    ensure_entries(gvfs_path)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

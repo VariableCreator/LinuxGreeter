@@ -1,0 +1,848 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+oidc-sso-cookie (the "helper")
+
+Takes the SSO cookies captured during the HM login
+(RP cookie mod_auth_openidc_session + IdP cookies shibboleth,
+__Host-JSESSIONID, __Host-shib_idp_session) into the logged-in
+user's Firefox, so HM pages are reachable on the desktop without
+another 2FA.
+
+The RP cookie ALONE is not enough: it is only valid for exactly one
+service (login.cs.hm.edu). The IdP cookies (sso.hm.edu) suppress the
+credential prompt for ALL HM services - without them every new
+IdP request asks for username/password.
+
+Invocation in user context (session autostart, see
+/etc/xdg/autostart/oidc-sso-cookie.desktop):
+
+    oidc-sso-cookie [--no-watch] [--wait-for-firefox]
+
+    --no-watch         do not start a background watcher when Firefox is running
+    --wait-for-firefox internal: wait until Firefox exits, then insert cookies (watcher mode)
+
+Flow:
+  1. Read the spool directory written by the root script during HM login
+     (~/.cache/oidc-login/sso-cookies/, one file per cookie,
+     0600, owned by the user).
+     If it is missing: nothing to do (exit 0).
+  2. Determine the Firefox profile (native, Snap, Flatpak); if none
+     exists, one is created. Firefox itself creates the
+     cookies.sqlite schema (short headless run) - no schema is
+     rebuilt by hand, because the moz_cookies columns differ
+     between versions (schema 13 vs. 17).
+  3. Insert all cookie files (only columns present in the DB)
+     and delete the spool.
+
+Environment (central config /etc/oidc-login/oidc-login.conf):
+  OIDC_FIREFOX_TIMEOUT  wait time for a running Firefox to exit (seconds)
+
+Security: the cookies are the user's SSO session; they live only in
+the user's own profile (and briefly in the spool, 0600) and expire with
+their own expiry date (IdP session at the HM IdP: about 1 hour).
+"""
+import base64
+import configparser
+import io
+import os
+import random
+import shutil
+import socket
+import sqlite3
+import string
+import subprocess
+import sys
+import time
+
+# Central config: /etc/oidc-login/oidc-login.conf (override via OIDC_CONFIG).
+# env already set always wins, so tests keep working.
+sys.path.insert(0, "/etc/oidc-login")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "..", "config"))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from oidc_config import load_config as _oidc_load_config
+    _oidc_load_config()
+except Exception:
+    pass
+
+
+class DatabaseLocked(Exception):
+    """cookies.sqlite is locked (Firefox running) - try again later."""
+
+
+def _int_env(name):
+    """Integer value from the central config (env > file); 0 when unset.
+
+    No default is duplicated here on purpose: oidc-login.conf owns the
+    values, the code only reads them.
+    """
+    try:
+        return int(os.environ.get(name, "") or 0)
+    except ValueError:
+        return 0
+
+
+# Spool directory inside the account home (from config; no hard-coded path).
+SPOOL_DIR_REL = os.environ.get("OIDC_SSO_SPOOL_REL", "")
+
+REQUIRED_KEYS = ("name", "host", "path", "expiry", "secure", "httponly",
+                 "value_b64")
+PROFILE_NAME = "hm-sso"
+# Injection defaults. QtWebEngine/QNetworkCookie knows neither SameSite nor
+# partition key - so the greeter cannot supply these fields. They are
+# set here deliberately instead of leaving them at the SQLite default (0):
+#   SAME_SITE_LAX = 1  top-level navigations send the cookie,
+#                      cross-site subresources do not.
+#   SCHEME_MAP    = 3  bitmap from nsICookie::schemeType (1 = HTTP, 2 = HTTPS).
+#   ORIGIN_ATTRIBUTES = "" no container / no partition / no private mode.
+SAME_SITE_LAX = 1
+SCHEME_MAP = 3
+ORIGIN_ATTRIBUTES = ""
+# Expiry given to a cookie without its own (session cookies).
+# Why this is needed (measured on 01.10. with Firefox 156):
+#   * Firefox does not store pure session cookies in moz_cookies at all -
+#     they only live in the running browser's memory.
+#   * An inserted row with expiry = 0 counts as "1.1.1970" in new versions,
+#     i.e. expired, and is NEVER sent. The cookie was then in the database,
+#     but the browser still showed the login page - exactly the bug the
+#     handover is supposed to fix.
+# The greeter supplies 0 for session cookies (Qt: isSessionCookie), so a
+# real, limited expiry is set here: 12 h by default (one desktop session;
+# the IdP session itself only lives ~1 h anyway).
+SESSION_LIFETIME = _int_env("OIDC_SSO_SESSION_LIFETIME")
+# Lower bound: a cookie whose expiry has (almost) passed would already be
+# worthless when inserted - so raise the remaining lifetime instead.
+MIN_LIFETIME = _int_env("OIDC_SSO_MIN_LIFETIME")
+# Write attempts when the database is locked (0 = do not check).
+# Firefox locks cookies.sqlite while running; a write attempt is then
+# discarded, which is why we wait for Firefox to exit instead.
+LOCK_RETRY = 1
+# Watcher: when Firefox is running at session start, wait for it to exit
+# before injecting cookies (cookies.sqlite is locked while Firefox runs).
+WATCH_MAX = _int_env("OIDC_FIREFOX_WATCH_MAX")
+
+
+# No log() helper on purpose: the helper is completely silent (see the module
+# docstring). Only usage errors still print.
+def fail(msg, code=1):
+    """Usage/argv error: the only case where the helper still prints.
+
+    Only reachable when a human types the command (autostart never passes an
+    unknown option), so this cannot add journal noise to normal sessions.
+    """
+    print("oidc-sso-cookie: ERROR: %s" % msg, file=sys.stderr, flush=True)
+    return code
+
+
+def current_user():
+    try:
+        import pwd
+        return pwd.getpwuid(os.getuid()).pw_name
+    except Exception:
+        return os.environ.get("USER", "unknown")
+
+
+def home():
+    return os.path.expanduser("~")
+
+
+def spool_dir():
+    """Path of the spool directory holding one file per cookie.
+
+    Empty when OIDC_SSO_SPOOL_REL is not configured - then there is no
+    spool to read (the config file owns the path).
+    """
+    if not SPOOL_DIR_REL:
+        return ""
+    return os.path.join(home(), SPOOL_DIR_REL)
+
+
+def read_spool_file(path):
+    """Read one spool file (key=value, value_b64 -> value)."""
+    data = {}
+    with io.open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            data[key.strip()] = value.strip()
+    missing = [k for k in REQUIRED_KEYS if k not in data]
+    if missing:
+        raise ValueError("spool %s incomplete (missing: %s)"
+                         % (path, ", ".join(missing)))
+    try:
+        data["value"] = base64.b64decode(data["value_b64"]).decode(
+            "utf-8", "replace")
+    except Exception as exc:
+        raise ValueError("spool %s: value_b64 invalid (%s)" % (path, exc))
+    try:
+        data["expiry"] = int(data["expiry"])
+    except ValueError:
+        data["expiry"] = 0
+    data["secure"] = 1 if str(data["secure"]).strip() == "1" else 0
+    data["httponly"] = 1 if str(data["httponly"]).strip() == "1" else 0
+    if not data["path"]:
+        data["path"] = "/"
+    data["host"] = normalize_host(data["host"], data["name"])
+    return data
+
+
+def is_ip_literal(host):
+    """IP address (v4/v6) instead of hostname? IPv6 possibly in brackets."""
+    bare = host.strip().strip("[]")
+    if not bare:
+        return False
+    for family in (socket.AF_INET, socket.AF_INET6):
+        try:
+            socket.inet_pton(family, bare)
+            return True
+        except (OSError, ValueError):
+            continue
+    return False
+
+
+def normalize_host(host, name=""):
+    """Prepare host for moz_cookies.
+
+    Firefox stores domain cookies WITH a leading dot, host-only cookies
+    WITHOUT - Qt/QNetworkCookie does not reveal this distinction. Hence:
+      * hostnames (login.cs.hm.edu, sso.hm.edu) get the dot,
+      * IP literals NEVER: a dot matches no host there, the cookie
+        would never be sent (send proof in tests/e2e-cookie.sh),
+      * __Host- prefixed cookies NEVER: the prefix requires host-only (no
+        domain attribute) - a dot contradicts that.
+    """
+    host = (host or "").strip()
+    bare = host.lstrip(".")
+    if not bare:
+        return ""
+    if is_ip_literal(bare) or name.startswith("__Host-"):
+        return bare
+    return "." + bare
+
+
+def read_all_spools():
+    """Collect all spooled cookies: (cookies, used_sources).
+
+    The spool directory yields one cookie per file. Broken files are
+    skipped (warning on stderr) so ONE defective cookie does not block all."""
+    cookies = []
+    used = []
+    path = spool_dir()
+    if not path or not os.path.isdir(path):
+        return cookies, used
+    try:
+        names = sorted(os.listdir(path))
+    except OSError:
+        return cookies, used
+    if not names:
+        return cookies, used
+    used.append(path)
+    for name in names:
+        if name.startswith("."):
+            continue
+        full = os.path.join(path, name)
+        if not os.path.isfile(full):
+            continue
+        try:
+            cookies.append(read_spool_file(full))
+        except Exception:
+            # Broken/partial spool file: skip it silently (the good cookies
+            # must still be transferred; the file disappears with the spool).
+            continue
+    return cookies, used
+
+
+def find_root():
+    """Determine the Firefox profile root (native, Snap or Flatpak)."""
+    h = home()
+    native = os.path.join(h, ".mozilla", "firefox")
+    snap = os.path.join(h, "snap", "firefox", "common", ".mozilla", "firefox")
+    flatpak = os.path.join(h, ".var", "app", "org.mozilla.firefox", ".mozilla", "firefox")
+    # Existing profiles take precedence: that is where the browser really is.
+    for candidate in (native, snap, flatpak):
+        if os.path.exists(os.path.join(candidate, "profiles.ini")):
+            return candidate
+    # No profile yet: usual location per installation type.
+    if (os.path.exists(os.path.join(h, "snap", "firefox"))
+            or os.path.exists("/snap/bin/firefox")):
+        return snap
+    if os.path.exists(os.path.join(h, ".var", "app", "org.mozilla.firefox")):
+        return flatpak
+    return native
+
+
+def read_profiles_ini(root):
+    """Read profiles.ini as a parser; a missing file yields an empty parser.
+
+    strict=False matters: Firefox can (through concurrent writes)
+    contain duplicate keys in one section. With strict=True, configparser
+    then raises DuplicateOptionError - the helper used to abort and never
+    imported anything. With strict=False the last value wins, just like
+    in Firefox.
+    """
+    parser = configparser.ConfigParser(strict=False)
+    parser.optionxform = str
+    ini = os.path.join(root, "profiles.ini")
+    if os.path.exists(ini):
+        try:
+            parser.read(ini, encoding="utf-8")
+        except Exception:
+            # Still make it readable: evaluate the lines ourselves (last value
+            # per key wins) and adopt them into the parser.
+            section = None
+            for line in io.open(ini, encoding="utf-8",
+                                errors="replace").read().splitlines():
+                stripped = line.strip()
+                if stripped.startswith("[") and stripped.endswith("]"):
+                    section = stripped[1:-1]
+                    if not parser.has_section(section):
+                        parser.add_section(section)
+                    continue
+                if section and "=" in stripped:
+                    key, _, value = stripped.partition("=")
+                    parser.set(section, key.strip(), value.strip())
+    if not parser.has_section("General"):
+        parser.add_section("General")
+    return parser
+
+
+def profile_dirs(root, parser):
+    """All profiles as a list (name, path, is_default)."""
+    out = []
+    for section in parser.sections():
+        if not section.startswith("Profile"):
+            continue
+        path = parser.get(section, "Path", fallback="")
+        if not path:
+            continue
+        if parser.get(section, "IsRelative", fallback="1") == "1":
+            path = os.path.join(root, path)
+        out.append((parser.get(section, "Name", fallback=""), path,
+                    parser.get(section, "Default", fallback="0") == "1"))
+    return out
+
+
+def is_usable_profile(path):
+    """A profile Firefox really uses: directory exists and contains
+    Firefox data. An empty directory (only created by us) does NOT count -
+    the cookie would sit there without ever being sent.
+    """
+    if not path or not os.path.isdir(path):
+        return False
+    return any(os.path.exists(os.path.join(path, name))
+               for name in ("prefs.js", "cookies.sqlite"))
+
+
+def newest_profile_with_db(root):
+    """Profile directory with the most recently modified cookies.sqlite.
+
+    This is the best hint as to which profile is actually used when
+    profiles.ini is missing, ambiguous or names outdated paths.
+    """
+    best = None
+    try:
+        entries = os.listdir(root)
+    except OSError:
+        return None
+    for name in sorted(entries):
+        db = os.path.join(root, name, "cookies.sqlite")
+        if not os.path.isfile(db):
+            continue
+        try:
+            mtime = os.path.getmtime(db)
+        except OSError:
+            continue
+        if best is None or mtime > best[0]:
+            best = (mtime, os.path.join(root, name))
+    return best[1] if best else None
+
+
+def choose_profile(root, parser):
+    """Choose the profile Firefox actually uses.
+
+    Order:
+      1. Default=1 from profiles.ini (if usable),
+      2. first usable profile from the ini,
+      3. profile directory with the newest cookies.sqlite
+         (covers missing/ambiguous ini and Snap/Flatpak),
+      4. None -> the caller creates a profile.
+
+    Important: profiles.ini is only READ. It belongs to Firefox; a
+    rewrite can produce duplicate keys and the cookie lands in
+    an unused profile.
+    """
+    profiles = profile_dirs(root, parser)
+    for _, path, is_default in profiles:
+        if is_default and is_usable_profile(path):
+            return path
+    for _, path, _ in profiles:
+        if is_usable_profile(path):
+            return path
+    return newest_profile_with_db(root)
+
+
+def ensure_default_profile(root, path):
+    """Make sure EXACTLY this profile carries `Default=1`.
+
+    Firefox itself sets `Default=1` on the last used profile - but the
+    `-CreateProfile` call does not do this in some versions.
+    Only this one marker is written (single-line addition, no file
+    recreation): profiles.ini belongs to Firefox.
+    Return: True if the file was changed.
+    """
+    ini = os.path.join(root, "profiles.ini")
+    if not os.path.exists(ini):
+        return False
+    try:
+        with io.open(ini, encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return False
+
+    target = os.path.abspath(path)
+    section = None
+    target_section = None
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            section = stripped[1:-1]
+            continue
+        if section is None or not section.startswith("Profile") or "=" not in stripped:
+            continue
+        key, _, value = stripped.partition("=")
+        if key.strip() != "Path":
+            continue
+        candidate = value.strip()
+        if not os.path.isabs(candidate):
+            candidate = os.path.join(root, candidate)
+        if os.path.abspath(candidate) == target:
+            target_section = section
+    if target_section is None:
+        return False
+
+    changed = False
+    # Remove Default=1 from all other sections ...
+    cleaned = []
+    section = None
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            section = stripped[1:-1]
+        elif section is not None and section != target_section and "=" in stripped:
+            key, _, value = stripped.partition("=")
+            if key.strip() == "Default" and value.strip() == "1":
+                changed = True
+                continue
+        cleaned.append(line)
+    lines = cleaned
+
+    # ... and add it in the target section if missing.
+    section = None
+    has_default = False
+    insert_at = None
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith("[") and stripped.endswith("]"):
+            if section == target_section and insert_at is None:
+                insert_at = index
+            section = stripped[1:-1]
+            continue
+        if section != target_section or "=" not in stripped:
+            continue
+        key, _, value = stripped.partition("=")
+        if key.strip() == "Default" and value.strip() == "1":
+            has_default = True
+        if key.strip() == "Path":
+            insert_at = index + 1
+    if not has_default and insert_at is not None:
+        lines.insert(insert_at, "Default=1")
+        changed = True
+
+    if not changed:
+        return False
+    try:
+        with io.open(ini, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+    except OSError:
+        return False
+    return True
+
+
+def create_profile(root, name=PROFILE_NAME):
+    """Create a Firefox profile - FIREFOX does the registration itself.
+
+    'firefox -CreateProfile "name dir"' creates the directory AND the entry
+    in profiles.ini without starting the browser (official command per
+    Mozilla wiki).
+    """
+    suffix = "".join(random.choice(string.ascii_lowercase + string.digits)
+                     for _ in range(8))
+    path = os.path.join(root, "%s.default-release" % suffix)
+    os.makedirs(root, mode=0o700, exist_ok=True)
+    binary = firefox_binary()
+    if binary:
+        try:
+            subprocess.call([binary, "-CreateProfile", "%s %s" % (name, path)],
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+    if not os.path.isdir(path):
+        os.makedirs(path, mode=0o700, exist_ok=True)
+    # Fallback: if there is NO profiles.ini at all, write one in
+    # Firefox format (no spaces around '=', exactly like Firefox). If one
+    # exists, it is not recreated.
+    ini = os.path.join(root, "profiles.ini")
+    if not os.path.exists(ini):
+        rel = os.path.relpath(path, root)
+        with io.open(ini, "w", encoding="utf-8") as f:
+            f.write("[General]\nStartWithLastProfile=1\nVersion=2\n\n"
+                    "[Profile0]\nName=%s\nIsRelative=1\nPath=%s\nDefault=1\n"
+                    % (name, rel))
+        os.chmod(ini, 0o600)
+    # When `-CreateProfile` registers the profile, `Default=1` is often missing.
+    # Add exactly this line (idempotent).
+    ensure_default_profile(root, path)
+    return path
+
+
+def firefox_running(user):
+    # stdout/stderr to DEVNULL: 'pgrep' would otherwise write the PID to our
+    # own stdout (which lands in the journal under autostart).
+    try:
+        return subprocess.call(
+            ["pgrep", "-u", user, "-x", "firefox"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0
+    except Exception:
+        return False
+
+
+def firefox_binary():
+    for candidate in ("firefox", "/usr/bin/firefox", "/snap/bin/firefox",
+                      "/var/lib/flatpak/exports/bin/org.mozilla.firefox"):
+        if os.path.isabs(candidate):
+            if os.path.exists(candidate):
+                return candidate
+        elif shutil.which(candidate):
+            return candidate
+    return None
+
+
+def wait_for_firefox_exit(user, timeout):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if not firefox_running(user):
+            return True
+        time.sleep(2)
+    return not firefox_running(user)
+
+
+def spawn_watcher(profile_path):
+    """Start ourselves in the background and wait for Firefox to exit.
+
+    Why: XFCE (and others) restore the session on login and start
+    Firefox immediately - our autostart then runs in parallel.
+    A cookie written to the database while Firefox is running can be
+    lost (Firefox keeps cookies in memory). So the watcher waits until
+    Firefox has exited and then inserts the cookie - on the next start
+    the session is there without credentials.
+    """
+    argv = [sys.executable, os.path.abspath(__file__), "--wait-for-firefox"]
+    if profile_path:
+        argv += ["--profile-path", profile_path]
+    try:
+        subprocess.Popen(argv, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                         start_new_session=True)
+        return True
+    except Exception:
+        return False
+
+
+def ensure_cookies_db(profile_path):
+    """Ensure cookies.sqlite; ONLY Firefox itself creates the schema.
+
+    Returns True if the DB (now) exists. Firefox is started once briefly
+    headless with exactly this profile; afterwards we wait for it to exit
+    up to OIDC_FIREFOX_TIMEOUT. If no Firefox binary exists, False is
+    returned (spool kept for later).
+    """
+    db = os.path.join(profile_path, "cookies.sqlite")
+    if os.path.exists(db):
+        return True
+    binary = firefox_binary()
+    if not binary:
+        return False
+    os.makedirs(profile_path, mode=0o700, exist_ok=True)
+    try:
+        subprocess.Popen(
+            [binary, "--headless", "--no-remote", "--profile", profile_path,
+             "about:blank"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, start_new_session=True)
+    except Exception:
+        return False
+    timeout = _int_env("OIDC_FIREFOX_TIMEOUT")
+    deadline = time.time() + max(timeout, 1)
+    while time.time() < deadline:
+        if os.path.exists(db):
+            break
+        time.sleep(2)
+    # A lingering headless process must not block the session; if needed
+    # we only kill our own leftovers.
+    try:
+        subprocess.call(["pkill", "-u", current_user(), "-f",
+                         "firefox.*--headless.*%s" % profile_path])
+    except Exception:
+        pass
+    return os.path.exists(db)
+
+
+def table_columns(db_path):
+    with sqlite3.connect(db_path) as conn:
+        rows = conn.execute("PRAGMA table_info(moz_cookies)").fetchall()
+    return {row[1] for row in rows}
+
+
+def inject_cookie(db_path, cookie):
+    """Insert cookie row schema-agnostically (only existing columns).
+
+    cookie: dict with name, value, host, path, expiry (seconds since epoch,
+    0 = session cookie), secure ("1"/"0"), httponly ("1"/"0"). Returns the
+    number of affected rows. Session cookies get a limited expiry
+    (SESSION_LIFETIME), see explanation above.
+    """
+    cols = table_columns(db_path)
+    if not {"name", "value", "host", "path"} <= cols:
+        raise RuntimeError("unexpected cookies.sqlite schema "
+                           "(columns: %s)" % sorted(cols))
+    if LOCK_RETRY > 0 and is_db_locked(db_path):
+        # Firefox holds the database exclusively (cookie journal). Writing
+        # again would be discarded - the watcher waits instead.
+        raise DatabaseLocked("cookies.sqlite is currently locked by Firefox")
+    return _insert_row(db_path, cookie, cols)
+
+
+def is_db_locked(db_path):
+    """Briefly check whether the database is writable (Firefox lock)."""
+    try:
+        with sqlite3.connect(db_path, timeout=2) as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.rollback()
+        return False
+    except sqlite3.OperationalError as exc:
+        if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+            return True
+        raise
+
+
+def expiry_unit(db_path, cols):
+    """Factor seconds -> storage unit of moz_cookies.expiry (1 or 10^6).
+
+    New Firefox versions (tested with Firefox 156) store timestamps in
+    **microseconds**; older ones in seconds (and use expiry = 0 for
+    session cookies). Detection in this order:
+      1. an existing row: lastAccessed/creationTime > 10^12 = microseconds,
+      2. otherwise the updateTime column (only present in the new schema),
+      3. otherwise seconds.
+    """
+    stamp = None
+    try:
+        with sqlite3.connect(db_path, timeout=5) as conn:
+            stamp = conn.execute(
+                "SELECT MAX(COALESCE(lastAccessed, 0), COALESCE(creationTime, 0))"
+                " FROM moz_cookies").fetchone()[0]
+    except Exception:
+        stamp = None
+    if stamp:
+        return 1000000 if int(stamp) > 10 ** 12 else 1
+    return 1000000 if "updateTime" in cols else 1
+
+
+def _insert_row(db_path, cookie, cols):
+    now = int(time.time())
+    try:
+        expiry = int(cookie.get("expiry", "0") or "0")
+    except ValueError:
+        expiry = 0
+    # Session cookie (expiry = 0) or almost expired: set a real expiry.
+    # Without its own expiry Firefox would discard the row.
+    lifetime = (expiry - now) if expiry > 0 else SESSION_LIFETIME
+    lifetime = max(lifetime, MIN_LIFETIME)
+    unit = expiry_unit(db_path, cols)
+    host = cookie.get("host", "")
+    row = {
+        "name": cookie.get("name", ""),
+        "value": cookie.get("value", ""),
+        "host": host,
+        "path": cookie.get("path", "/") or "/",
+        "expiry": (now + lifetime) * unit,
+        "lastAccessed": now * unit,
+        "creationTime": now * unit,
+        "updateTime": now * unit,
+        "isSecure": 1 if str(cookie.get("secure", 0)).strip() == "1" else 0,
+        "isHttpOnly": 1 if str(cookie.get("httponly", 0)).strip() == "1" else 0,
+        "baseDomain": host.lstrip("."),
+        # The greeter does not supply these fields (Qt does not know them) -
+        # they are set deliberately instead of leaving the SQLite default 0.
+        # Missing columns drop out below (schema versions!).
+        "schemeMap": SCHEME_MAP,
+        "sameSite": SAME_SITE_LAX,
+        "rawSameSite": SAME_SITE_LAX,
+        "originAttributes": ORIGIN_ATTRIBUTES,
+        "isPartitionedAttributeSet": 0,
+    }
+    # Only write columns that really exist in this Firefox version.
+    row = {k: v for k, v in row.items() if k in cols}
+    # timeout = SQLite busy timeout: if Firefox runs in parallel, the write
+    # waits briefly instead of aborting immediately with "database is locked".
+    with sqlite3.connect(db_path, timeout=10) as conn:
+        conn.execute("PRAGMA busy_timeout = 10000")
+        # uniqueid is (name, host, path, originAttributes) - so delete on
+        # exactly that, otherwise old rows of the same identity would remain
+        # and the insert would fail with a constraint error.
+        # Older schemas lack originAttributes -> only include it then.
+        delete_sql = ("DELETE FROM moz_cookies WHERE name = ? AND host = ?"
+                      " AND path = ?")
+        delete_args = [row["name"], row["host"], row["path"]]
+        if "originAttributes" in row:
+            delete_sql += " AND originAttributes = ?"
+            delete_args.append(row["originAttributes"])
+        conn.execute(delete_sql, delete_args)
+        placeholders = ", ".join("?" for _ in row)
+        columns = ", ".join(row.keys())
+        cur = conn.execute(
+            "INSERT INTO moz_cookies (%s) VALUES (%s)" % (columns,
+                                                          placeholders),
+            tuple(row.values()))
+        conn.commit()
+        return cur.rowcount
+
+
+
+def remove_spool(path):
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+    except Exception:
+        # Not removable (permissions?): it simply stays for the next run.
+        pass
+
+
+def remove_spool_dir(path):
+    """Empty the spool directory (delete the files inside). The directory
+    itself stays (0700, owned by the user) - it is deleted with the home
+    and does no harm."""
+    if not path:
+        return
+    try:
+        names = os.listdir(path)
+    except FileNotFoundError:
+        return
+    except Exception:
+        return
+    for name in names:
+        if name.startswith("."):
+            continue
+        full = os.path.join(path, name)
+        if os.path.isfile(full):
+            remove_spool(full)
+
+
+def main(argv):
+    wait_for_firefox = False
+    no_watch = False
+    i = 1
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--wait-for-firefox":
+            wait_for_firefox = True
+            i += 1
+        elif arg == "--no-watch":
+            no_watch = True
+            i += 1
+        elif arg in ("-h", "--help"):
+            print(__doc__)
+            return 0
+        else:
+            return fail("unknown option: %s (see --help)" % arg, code=2)
+
+    cookies, _used_sources = read_all_spools()
+    # Filter out empty/broken entries (read_all_spools skips unusable files).
+    todo = [c for c in cookies if c.get("name") and c.get("host") and c.get("value")]
+    if not todo:
+        # Only clean up orphaned leftover profiles, otherwise nothing to do.
+        root = find_root()
+        stray = None
+        if root and os.path.isdir(root):
+            stray = os.path.join(root, PROFILE_NAME)
+        if stray and os.path.isdir(stray) and not os.listdir(stray):
+            try:
+                os.rmdir(stray)
+            except OSError:
+                pass
+        return 0
+    cookies = todo
+    # Determine the profile.
+    root = find_root()
+    parser = read_profiles_ini(root)
+    profile_path = choose_profile(root, parser)
+    if profile_path is None:
+        os.makedirs(root, mode=0o700, exist_ok=True)
+        profile_path = create_profile(root)
+        parser = read_profiles_ini(root)
+    else:
+        # For an existing profile, make sure it is marked as default
+        # if the ini has no default at all (otherwise it is undetermined
+        # which profile Firefox starts).
+        ensure_default_profile(root, profile_path)
+    user = current_user()
+
+    if wait_for_firefox:
+        # Background watcher: wait until Firefox has exited, then insert.
+        if not wait_for_firefox_exit(user, WATCH_MAX):
+            return 2
+    else:
+        timeout = _int_env("OIDC_FIREFOX_TIMEOUT")
+        if timeout > 0:
+            if not wait_for_firefox_exit(user, timeout):
+                # Firefox keeps running - spool stays, watcher retries later
+                if not no_watch:
+                    spawn_watcher(profile_path)
+                return 2
+
+    if not ensure_cookies_db(profile_path):
+        return 3
+    failed = []
+    locked = False
+    for cookie in cookies:
+        try:
+            inject_cookie(os.path.join(profile_path, "cookies.sqlite"), cookie)
+        except Exception as exc:
+            # "database is locked"/"busy" means: Firefox is running and holds
+            # the database. That is not an error; it is retried later.
+            if "locked" in str(exc).lower() or "busy" in str(exc).lower():
+                locked = True
+                break
+            failed.append((cookie.get("name", "?"), str(exc)))
+    if locked:
+        if not no_watch:
+            spawn_watcher(profile_path)
+        return 2
+    if failed:
+        # Broken cookies must not block good ones: partial success counts.
+        # Only if NOTHING at all was transferred is it an error (exit 1).
+        if len(failed) >= len(cookies):
+            return 1
+    # Success (including partial success): empty the spool directory.
+    remove_spool_dir(spool_dir())
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

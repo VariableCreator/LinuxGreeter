@@ -1,0 +1,16 @@
+[SddmGreeterTheme]
+Name=maya-hm
+Description=Win11-style glass theme with HM-Anmeldung (oidc-login)
+Author=Sanjeev Premi
+Copyright=(c) 2016, Sanjeev Premi
+License=CC-BY-SA
+Type=sddm-theme
+Version=0.2
+Website=https://github.com/spremi
+Screenshot=screenshots/hi_IN.png
+MainScript=Main.qml
+ConfigFile=theme.conf
+TranslationsDirectory=translations
+Email=spremi@ymail.com
+Theme-Id=maya-hm
+Theme-API=2.0

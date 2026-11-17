@@ -1,0 +1,674 @@
+#!/usr/bin/env bash
+# oidc-session-account
+#
+# Managing temporary session accounts for the HM login at the SDDM greeter.
+# A session account is a local user account with sudo rights matching the
+# HM credentials. It is created on successful OIDC login and
+# deleted on normal logout (PAM close_session) and at every greeter start
+# (Xsetup cleanup; persistent accounts survive unless --force) -
+# see oidc-session-cleanup and install.sh.
+#
+# This script runs exclusively as root via a tight sudoers rule:
+#   sddm ALL=(ALL) NOPASSWD: /usr/local/sbin/oidc-session-account
+#
+# Subcommands:
+#   create                      reads from stdin:
+#                               1. "base64(user)<TAB>base64(pass)"
+#                               2. number of SSO cookies, then per cookie
+#                                  "base64(name)<TAB>base64(value)<TAB>host<TAB>path<TAB>expiry<TAB>secure<TAB>httponly"
+#                             and creates or updates the session account.
+#                             The SSO cookies are additionally stored as files in
+#                             <account-home>/.cache/oidc-login/sso-cookies/
+#                             (0600, owned by the account); the
+#                             autostart helper sso-cookie/oidc-sso-cookie
+#                             picks them up at session start into the user's Firefox
+#                             so HM pages are reachable without another 2FA.
+#                             Additionally the cloud-storage spool is written to
+#                             <home>/.cache/oidc-login/cloud-storage (0600,
+#                             user_b64/lrz_user/pass_b64); the
+#                             autostart helper cloud-mount/oidc-cloud-mount
+#                             uses it at session start to mount the
+#                             LRZ network drive (webdisk.ads.mwn.de/hcwebdav
+#                             as ADS\<id>, fail-soft: without a mount
+#                             the session continues unchanged).
+#   delete-user <user>        deletes ONLY tracked session accounts (manual:
+#                             always deletes, even if persistent).
+#   delete-user-auto <user>   automatic deletion (logout hook): keeps persistent
+#                             accounts (OIDC_SESSION_TEMPORARY=false).
+#   cleanup-all [--force]     deletes all tracked session accounts (called by
+#                             Xsetup at EVERY greeter start). Keeps persistent
+#                             accounts (OIDC_SESSION_TEMPORARY=false);
+#                             --force also deletes those (install.sh --uninstall).
+#                             Any other option is rejected with a usage error
+#                             (a typo must never silently keep accounts).
+#
+# Robustness: the HM login must not fail on stale leftovers
+# (otherwise "ERROR: username 'x' already exists" on every attempt).
+#   * An existing account that comes from us (tracking entry, GECOS marker
+#     or orphaned rest without a usable password) is taken over:
+#     update password, ensure admin group and tracking.
+#   * If the name is taken by a REAL account, it stays untouched;
+#     instead a separate account with suffix is created (-hm, -hm2, ...).
+#   * The tracking entry is written BEFORE useradd and only removed again
+#     when useradd fails - no half-finished account is left
+#     behind that would be rejected on the next attempt.
+#   * On deletion the tracking entry is only removed when the account
+#     is really gone. Otherwise it is kept (takeover on the
+#     next login).
+#
+
+set -euo pipefail
+
+# Under PAM (pam_exec from the display manager) PATH is minimal
+# (/usr/bin:/bin) - /usr/sbin is missing, then it says "userdel: command not
+# found" and the account stays behind. So set it explicitly here.
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+# --- Central config (env > /etc/oidc-login/oidc-login.conf) ---
+# Loads KEY=VALUE; already set (exported) variables always win,
+# so OIDC_* overrides in tests keep working. The config file is the single
+# source of truth - the code below keeps no duplicate default values.
+_oidc_conf_file=""
+if [[ -n "${OIDC_CONFIG:-}" ]]; then
+    [[ -f "$OIDC_CONFIG" ]] && _oidc_conf_file="$OIDC_CONFIG"
+elif [[ -f /etc/oidc-login/oidc-login.conf ]]; then
+    _oidc_conf_file=/etc/oidc-login/oidc-login.conf
+fi
+if [[ -n "$_oidc_conf_file" && -f "$_oidc_conf_file" ]]; then
+    OIDC_LOADED_CONFIG="$_oidc_conf_file"
+    while IFS= read -r _line || [[ -n "$_line" ]]; do
+        _line="${_line#"${_line%%[![:space:]]*}"}"
+        _line="${_line%"${_line##*[![:space:]]}"}"
+        [[ -z "$_line" || "$_line" == \#* || "$_line" != *=* ]] && continue
+        _k="${_line%%=*}"; _v="${_line#*=}"
+        _k="${_k#"${_k%%[![:space:]]*}"}"; _k="${_k%"${_k##*[![:space:]]}"}"
+        _v="${_v#"${_v%%[![:space:]]*}"}"; _v="${_v%"${_v##*[![:space:]]}"}"
+        if [[ "$_v" == \"*\" && ${#_v} -ge 2 ]]; then _v="${_v:1:-1}";
+        elif [[ "$_v" == \'*\' && ${#_v} -ge 2 ]]; then _v="${_v:1:-1}"; fi
+        [[ "$_k" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+        # env wins: only fill when the variable is UNSET (exported-empty
+        # counts as set, so tests can force-disable a value).
+        if [[ -z "${!_k+x}" ]]; then printf -v "$_k" '%s' "$_v"; fi
+    done < "$_oidc_conf_file"
+fi
+unset _oidc_conf_file _line _k _v
+
+ACCOUNTS_FILE="$OIDC_ACCOUNTS_FILE"
+# Spool directory for the Firefox SSO export (sso-cookie/oidc-sso-cookie):
+# stored in the account home under .cache/oidc-login/sso-cookies/ (0700,
+# owned by the account), inside one file per cookie (filename = sha256 of
+# name+host, content name/host/path/expiry/secure/httponly/value_b64, 0600).
+# Multiple cookies are needed: the RP cookie (mod_auth_openidc_session,
+# login.cs.hm.edu) alone only covers exactly that service - the
+# IdP cookies (shibboleth/__Host-JSESSIONID/__Host-shib_idp_session,
+# sso.hm.edu) suppress the credential prompt on ALL HM services.
+# Reasons for the home store instead of a global directory:
+#   * the home is created anyway when the account is made (useradd -m) and is
+#     deleted on logout/reboot via 'userdel -r' along with the cookie - so
+#     no spool can be left behind;
+#   * no global drop point and no SELinux special case (on Fedora
+#     /var/lib carries var_t, which a user process may otherwise not read).
+# Subpath in the account home: the DIRECTORY "sso-cookies/" with one file
+# per cookie.
+SSO_SPOOL_REL="$OIDC_SSO_SPOOL_REL"
+# Cloud-storage spool for the LRZ network drive (cloud-mount/oidc-cloud-mount):
+# stored in the account home under .cache/oidc-login/cloud-storage (0600,
+# owned by the account): user_b64/lrz_user/pass_b64. The LRZ name is
+# "hm-<HM original name>" with the SAME password (e.g. tester -> hm-tester).
+# The helper mounts davs://webdisk.ads.mwn.de/hcwebdav as
+# ADS\<lrz_user> via Gio/GVFS; fail-soft: without spool/server/password there is simply
+# no network drive, the session continues unchanged. The spool is
+# deleted automatically with 'userdel -r' (like the SSO spool).
+CLOUD_SPOOL_REL="$OIDC_CLOUD_SPOOL_REL"
+# Full URL wins; otherwise it is derived from host + path (both from config).
+if [[ -n "$OIDC_CLOUD_URL" ]]; then
+    CLOUD_URL="$OIDC_CLOUD_URL"
+else
+    CLOUD_URL="https://${OIDC_CLOUD_HOST}${OIDC_CLOUD_PATH}"
+fi
+# GECOS comment: marks the accounts we created (useradd -c) and
+# allows takeover even when the tracking entry was lost.
+ACCOUNT_COMMENT="$OIDC_ACCOUNT_COMMENT"
+SESSION_SUFFIX="$OIDC_SESSION_SUFFIX"
+# Account lifetime (strict true/false): true = temporary (auto-delete on
+# logout / greeter start), false = persistent (survives both; re-login reuses
+# the same account and only refreshes password + spools). Only the manual
+# 'delete-user' and 'cleanup-all --force' remove a persistent account.
+SESSION_TEMPORARY="${OIDC_SESSION_TEMPORARY:-true}"
+session_is_persistent() {
+    [[ "$SESSION_TEMPORARY" == "false" ]]
+}
+
+require_root() {
+    [[ "$(id -u)" == "0" ]] || { echo "FEHLER: root erforderlich" >&2; exit 1; }
+}
+
+# Normalize usernames (lowercase, only [a-z0-9._-], <=32 chars)
+# @-part (e.g. "name@hm.edu") is removed, leading digits are
+# removed (user NAME must not start with a digit).
+sanitize_user() {
+    local raw="$1" out
+    out="${raw,,}"
+    out="${out%%@*}"
+    out="${out//[^a-z0-9._-]/_}"
+    out="${out/[_][_-]*/}"   # collapse multiple underscores
+    out="$(printf '%s' "$out" | sed -E 's/\.{2,}/./g; s/_-/_/g; s/_-/_/g; s/^-+//')"
+    # strip leading digits
+    while [[ "$out" =~ ^[0-9] ]]; do out="${out:1}"; done
+    out="${out:0:32}"
+    [[ -n "$out" ]] || out="hmuser"
+    printf '%s' "$out"
+}
+
+is_tracked() {
+    [[ -f "$ACCOUNTS_FILE" ]] && grep -qx "$1" "$ACCOUNTS_FILE" 2>/dev/null
+}
+
+track_user() {
+    if is_tracked "$1"; then
+        return 0
+    fi
+    mkdir -p "$(dirname "$ACCOUNTS_FILE")"
+    touch "$ACCOUNTS_FILE"
+    chmod 0600 "$ACCOUNTS_FILE"
+    echo "$1" >> "$ACCOUNTS_FILE"
+}
+
+untrack_user() {
+    [[ -f "$ACCOUNTS_FILE" ]] || return 0
+    sed -i "/^${1}$/d" "$ACCOUNTS_FILE" 2>/dev/null || true
+}
+
+# An account that comes from us (and may therefore be taken over/updated).
+# Two signals:
+#   1. tracking entry   -> we created the account.
+#   2. GECOS marker     -> created by us, tracking entry lost.
+# Anything else counts as a foreign account and is NEVER touched.
+is_our_account() {
+    local u="$1" gecos
+    if is_tracked "$u"; then
+        return 0
+    fi
+    gecos="$(getent passwd "$u" 2>/dev/null | cut -d: -f5)"
+    if [[ "$gecos" == "$ACCOUNT_COMMENT" ]]; then
+        return 0
+    fi
+    return 1
+}
+
+# Admin group per distro: Fedora/RHEL = wheel, Debian/Ubuntu = sudo.
+# Uses whichever group actually exists on the system.
+ensure_admin_group() {
+    local u="$1" admin_group=""
+    if getent group wheel >/dev/null 2>&1; then
+        admin_group="wheel"
+    elif getent group sudo >/dev/null 2>&1; then
+        admin_group="sudo"
+    fi
+    if [[ -z "$admin_group" ]]; then
+        return 0
+    fi
+    if ! id -nG "$u" 2>/dev/null | tr ' ' '\n' | grep -qx "$admin_group"; then
+        usermod -aG "$admin_group" "$u" >/dev/null 2>&1 || true
+    fi
+}
+
+# Home directory of an account (fallback /home/<account> if getent returns no
+# entry - then no home exists either and there is no spool).
+account_home() {
+    local h
+    h="$(getent passwd "$1" 2>/dev/null | cut -d: -f6)"
+    [[ -n "$h" ]] || h="/home/$1"
+    printf '%s' "$h"
+}
+
+# Path of the account's SSO spool DIRECTORY (without existence check).
+sso_spool_path() {
+    printf '%s/%s' "$(account_home "$1")" "$SSO_SPOOL_REL"
+}
+
+# Filename in the spool directory: stable per cookie (the same cookie
+# overwrites itself), but without the cookie name in plain text.
+sso_spool_name() {
+    printf '%s\x00%s' "$1" "$2" | sha256sum 2>/dev/null | cut -d' ' -f1
+}
+
+write_sso_spool() {
+    # Writes ONE SSO cookie as a file into the spool directory.
+    # Arguments: account name_b64 value_b64 host path expiry secure httponly.
+    # Without a cookie value: no spool (silent success).
+    local konto="$1" name_b64="$2" value_b64="$3" host="$4" path="$5"
+    local expiry="$6" secure="$7" httponly="$8"
+    [[ -n "$value_b64" ]] || return 0
+    local name
+    name="$(printf '%s' "$name_b64" | base64 -d 2>/dev/null || true)"
+    [[ -n "$name" ]] || return 0
+    # Empty host: no spool - a cookie without a domain would never be
+    # sent by Firefox. (The greeter always sets the cookie domain; hostname -f
+    # would be wrong here, that is the local machine name, not the HM domain.)
+    [[ -n "$host" ]] || return 0
+    # Prepare the host. Firefox stores domain cookies WITH a leading dot,
+    # host-only cookies WITHOUT - Qt/QNetworkCookie does not reveal which one
+    # it is. Therefore:
+    #   * hostnames (login.cs.hm.edu, sso.hm.edu) get the dot,
+    #   * IP literals NEVER (a dot does not match any host there),
+    #   * __Host prefixed cookies NEVER (that prefix requires host-only).
+    # The helper (sso-cookie/oidc-sso-cookie, normalize_host) applies the same
+    # rule - both places must stay identical.
+    if [[ "$host" == *:* || "$host" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ || "$name" == __Host-* ]]; then
+        host="${host#.}"
+    elif [[ "$host" != .* ]]; then
+        host=".$host"
+    fi
+    [[ -n "$path" ]] || path="/"
+    [[ "$expiry" =~ ^[0-9]+$ ]] || expiry=0
+    [[ "$secure" == 1 ]] || secure=0
+    [[ "$httponly" == 1 ]] || httponly=0
+    local dir fname tmp
+    dir="$(sso_spool_path "$konto")"
+    fname="$(sso_spool_name "$name" "$host")"
+    [[ -n "$fname" ]] || return 0
+    # Symlink guard: root writes here - a symlink created by the user
+    # would redirect the write. Better no spool at all then.
+    if [[ -L "$dir" ]]; then
+        return 0        # symlink where root should write: no spool at all
+    fi
+    mkdir -p "$dir" 2>/dev/null || return 0
+    chmod 0700 "$dir" 2>/dev/null || true
+    # Also set the intermediate directory (.cache/oidc-login) to 0700: root
+    # creates it with umask 022 (0755); the spool should only be
+    # reachable through its owner.
+    chmod 0700 "$(dirname "$dir")" 2>/dev/null || true
+    # The directory belongs to the account so that the autostart helper (runs as
+    # the user) may read the spool. '.cache' may have just been
+    # created - hand it over as well then.
+    chown -- "$konto:$konto" "$dir" "$(dirname "$dir")" 2>/dev/null \
+        || chown -- "$konto:$konto" "$dir" 2>/dev/null || true
+    tmp="$(mktemp "$dir/.sso-cookie.XXXXXX" 2>/dev/null)" || return 0
+    {
+        printf 'name=%s\n' "$name"
+        printf 'host=%s\n' "$host"
+        printf 'path=%s\n' "$path"
+        printf 'expiry=%s\n' "$expiry"
+        printf 'secure=%s\n' "$secure"
+        printf 'httponly=%s\n' "$httponly"
+        printf 'value_b64=%s\n' "$value_b64"
+    } >"$tmp"
+    chmod 0600 "$tmp"
+    chown -- "$konto:$konto" "$tmp" 2>/dev/null \
+        || chown -- "$konto" "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$dir/$fname"
+}
+
+# LRZ name from the HM id: "hm-<id>", same password.
+# Do not double-prefix already prefixed names ("hm-x"); replace chars
+# outside [a-z0-9._-] (like sanitize_user, but WITHOUT
+# adopting the leading-digit stripping - "hm-" starts with a letter).
+# Fallback "hmuser" for empty input.
+map_lrz_user() {
+    local raw="$1" out
+    out="${raw,,}"
+    out="${out%%@*}"
+    out="${out//[^a-z0-9._-]/_}"
+    out="${out:0:28}"
+    [[ -n "$out" ]] || out="hmuser"
+    if [[ "$out" == hm-* ]]; then
+        printf '%s' "${out:0:32}"
+    else
+        printf '%s' "hm-${out:0:29}"
+    fi
+}
+
+# Path of an account's cloud-storage spool FILE (without existence check).
+cloud_spool_path() {
+    printf '%s/%s' "$(account_home "$1")" "$CLOUD_SPOOL_REL"
+}
+
+write_cloud_spool() {
+    # Writes user_b64/lrz_user/pass_b64 for the mount helper.
+    # Arguments: account user_b64 pass_b64. Fail-soft: on error only a warning,
+    # the login continues without a network drive.
+    local konto="$1" user_b64="$2" pass_b64="$3"
+    [[ -n "$pass_b64" ]] || return 0
+    local raw lrz path dir tmp
+    raw="$(printf '%s' "$user_b64" | base64 -d 2>/dev/null || true)"
+    [[ -n "$raw" ]] || return 0
+    lrz="$(map_lrz_user "$raw")"
+    path="$(cloud_spool_path "$konto")"
+    dir="$(dirname "$path")"
+    if [[ -L "$dir" || -L "$path" ]]; then
+        return 0        # symlink where root should write: no cloud spool
+    fi
+    mkdir -p "$dir" 2>/dev/null || return 0
+    chmod 0700 "$dir" 2>/dev/null || true
+    # Intermediate directory (.cache/oidc-login) also 0700 (root umask!).
+    chmod 0700 "$(dirname "$dir")" 2>/dev/null || true
+    chown -- "$konto:$konto" "$dir" "$(dirname "$dir")" 2>/dev/null \
+        || chown -- "$konto:$konto" "$dir" 2>/dev/null || true
+    tmp="$(mktemp "$dir/.cloud-storage.XXXXXX" 2>/dev/null)" || return 0
+    {
+        printf 'user_b64=%s\n' "$user_b64"
+        printf 'lrz_user=%s\n' "$lrz"
+        printf 'pass_b64=%s\n' "$pass_b64"
+    } >"$tmp"
+    chmod 0600 "$tmp"
+    chown -- "$konto:$konto" "$tmp" 2>/dev/null \
+        || chown -- "$konto" "$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$path"
+}
+
+remove_cloud_spool() {
+    # Remove the account's cloud spool (logout/boot); missing is fine.
+    local p
+    p="$(cloud_spool_path "$1")"
+    if [[ -e "$p" ]]; then
+        rm -f "$p" || true
+    fi
+    return 0
+}
+
+remove_sso_spool() {
+    # Remove the account's spool directory (logout/boot); missing is fine.
+    local p
+    p="$(sso_spool_path "$1")"
+    if [[ -e "$p" ]]; then
+        rm -rf "$p" || true
+    fi
+    return 0
+}
+
+# Deletes a tracked session account. The tracking entry is ONLY removed
+# when the account is really gone afterwards; otherwise it is kept so the
+# next login can take the account over (instead of rejecting it).
+#
+# Mode $2: 'manual' always deletes; 'auto' (logout hook / greeter-start
+# cleanup) keeps persistent accounts (OIDC_SESSION_TEMPORARY=false), which are
+# reused on re-login (same name, refreshed password + cookie spools).
+#
+# NOTE on running processes: 'userdel -r' refuses ("user ... is
+# currently used by process ...") while processes of the account still run.
+# On normal logout the user session does end - but leftovers frequently
+# remain (gvfsd-*, dbus, background jobs). Therefore cleanup happens here BEFORE
+# userdel: unmount the account's GVFS-FUSE, briefly nudge remaining processes
+# (pkill -TERM, 1 s), then immediately userdel -f -r.
+# Only after that does userdel run; if it still fails, the tracking
+# entry is kept (takeover on the next login instead of "already exists").
+delete_user() {
+    local u="$1" mode="${2:-manual}" uid="" active_sess="" active_n="" sess _uid _user _rest st
+    if [[ "$mode" == "auto" ]] && session_is_persistent; then
+        # Persistent account (OIDC_SESSION_TEMPORARY=false): keep it.
+        return 0
+    fi
+    if ! id "$u" >/dev/null 2>&1; then
+        # Account is already gone -> only clean up the tracking entry.
+        untrack_user "$u"
+        remove_sso_spool "$u" || true
+        remove_cloud_spool "$u" || true
+        return 0
+    fi
+    if ! is_tracked "$u"; then
+        return 11       # foreign account: never touched
+    fi
+    # IMPORTANT - switch-user case: if "Switch user" jumps into another
+    # session and logs out there, that logged-out session may CONTINUE in the
+    # background (only the visible VT switches). Deletion MUST NOT happen
+    # then - otherwise the home would be pulled out from under a still running
+    # session. Therefore check BEFORE any intervention (also before pkill!)
+    # whether ANOTHER active logind session of the account still exists. The
+    # session that was just closed does NOT count: while PAM close_session runs,
+    # logind often still reports it as "active"/"online" (it has not yet
+    # switched to "closing"). Exactly ONE active session is therefore the
+    # normal case at logout (its own, currently closing one) - only from
+    # TWO active sessions is there really a second session continuing
+    # (e.g. user switch with a remaining second session) and then deletion
+    # does NOT happen. Sessions in state "closing" never count.
+    if command -v loginctl >/dev/null 2>&1; then
+        active_sess=""
+        while read -r sess _uid _user _rest; do
+            [[ "$_user" == "$u" ]] || continue
+            st="$(loginctl show-session "$sess" -p State --value 2>/dev/null || true)"
+            if [[ "$st" == "active" || "$st" == "online" ]]; then
+                active_sess="$active_sess $sess"
+            fi
+        done < <(loginctl list-sessions --no-legend 2>/dev/null || true)
+        # Word count = number of active sessions of the account (without
+        # modifying $1/$2 - $1 is the username).
+        active_n="$(printf '%s' "$active_sess" | wc -w | tr -d ' ')"
+        if [[ "${active_n:-0}" -ge 2 ]]; then
+            # Another session of the account is still running (user switch):
+            # do not delete, keep the tracking entry.
+            return 1
+        fi
+    fi
+    uid="$(id -u "$u" 2>/dev/null || true)"
+    # NO 'loginctl terminate-user' here: this code runs in the PAM
+    # close_session of the session that was just closed. loginctl would end
+    # its own (closing) session while PAM waits for us - that deadlocks
+    # (outcome: black screen instead of greeter).
+    # logind tears down the closed session itself anyway; here it is only
+    # about leftover processes that would block 'userdel -r'.
+    # All steps are deliberately kept short (max. ~2 s) so that the logout
+    # does not hang.
+    # 1) Unmount the account's GVFS-FUSE (otherwise it blocks 'userdel -r' via
+    #    the still occupied home resp. /run/user/<uid>; lazy, does not block).
+    if [[ -n "$uid" ]]; then
+        if command -v fusermount3 >/dev/null 2>&1; then
+            fusermount3 -u "/run/user/$uid/gvfs" 2>/dev/null || true
+        elif command -v fusermount >/dev/null 2>&1; then
+            fusermount -u "/run/user/$uid/gvfs" 2>/dev/null || true
+        fi
+        umount -l "/run/user/$uid/gvfs" 2>/dev/null || true
+        umount -l "/run/user/$uid" 2>/dev/null || true
+    fi
+    # 2) Terminate remaining processes of the account - first TERM, then KILL.
+    # PAM waits for us, hence deliberately short (max. ~3 s). The KILL is
+    # necessary: some leftovers (gvfsd-fuse in D state, dbus/systemd --user)
+    # ignore TERM - and EVERY remaining process makes 'userdel -r'
+    # fail ("currently used by process").
+    if pgrep -u "$u" >/dev/null 2>&1; then
+        pkill -TERM -u "$u" 2>/dev/null || true
+        sleep 2
+        if pgrep -u "$u" >/dev/null 2>&1; then
+            pkill -KILL -u "$u" 2>/dev/null || true
+            sleep 1
+        fi
+    fi
+    # 3) Delete the account (forced if needed). userdel -r fails with leftover
+    # processes; userdel -f -r deletes anyway (Debian/shadow: -f forces
+    # even with a logged-in user). NOTE: userdel reports exit != 0
+    # even for harmless warnings ("mail spool not found") - the account
+    # is gone anyway then. Therefore ONLY the re-check (id), not the
+    # exit code, decides success/failure. Output is discarded: the helper
+    # stays silent, the result is the exit code.
+    userdel -r "$u" >/dev/null 2>&1 || userdel -f -r "$u" >/dev/null 2>&1 || true
+    if id "$u" >/dev/null 2>&1; then
+        return 1        # still there: keep the tracking entry (takeover)
+    fi
+    untrack_user "$u"
+    remove_sso_spool "$u" || true
+    remove_cloud_spool "$u" || true
+    return 0
+}
+
+case "${1:-}" in
+    create)
+        require_root
+        # stdin protocol (multi-line, see mainwindow.cpp):
+        #   line 1: "base64(user)<TAB>base64(pass)"
+        #   line 2: number of SSO cookies (decimal; "0" = none)
+        #   then ONE line per cookie:
+        #     "base64(name)<TAB>base64(value)<TAB>host<TAB>path<TAB>expiry<TAB>secure<TAB>httponly"
+        shift
+        if [[ $# -gt 0 ]]; then
+            case "$1" in
+                --cookie|--cookie-*)
+                    echo "FEHLER: veraltetes oidc-login Browser-Binary - 'sudo ./install.sh' neu ausführen (baut den Browser neu)" >&2
+                    exit 2
+                    ;;
+            esac
+            echo "usage: oidc-session-account create (cookies arrive via stdin)" >&2
+            exit 2
+        fi
+        # Credentials: line 1 "base64(user)<TAB>base64(pass)".
+        IFS=$'\t' read -r user_b64 pass_b64 || true # we do our own error check on the next line
+        [[ -n "$user_b64" && -n "$pass_b64" ]] || { echo "FEHLER: keine Zugangsdaten auf stdin" >&2; exit 3; }
+        # line 2: the cookie COUNT, then one line per cookie.
+        IFS= read -r cookie_line2 <&0 || cookie_line2=""
+        cookie_line2="${cookie_line2%$'\r'}"
+        declare -a c_names=() c_values=() c_hosts=() c_paths=() c_exp=() c_sec=() c_http=()
+        if [[ "$cookie_line2" =~ ^[0-9]+$ ]]; then
+            ncookies="$cookie_line2"
+            (( ncookies <= 32 )) || { echo "FEHLER: zu viele SSO-Cookies ($ncookies)" >&2; exit 3; }
+            for (( i=0; i<ncookies; i++ )); do
+                IFS= read -r cline <&0 || cline=""
+                cline="${cline%$'\r'}"
+                [[ -n "$cline" ]] || continue
+                IFS=$'\t' read -r nb vb h p e s ht _rest <<<"$cline"
+                c_names+=("${nb:-}"); c_values+=("${vb:-}")
+                c_hosts+=("${h:-}"); c_paths+=("${p:-/}")
+                c_exp+=("${e:-0}"); c_sec+=("${s:-0}"); c_http+=("${ht:-0}")
+            done
+        fi
+        user="$(printf '%s' "$user_b64" | base64 -d 2>/dev/null || true)"
+        pass="$(printf '%s' "$pass_b64" | base64 -d 2>/dev/null || true)"
+        [[ -n "$user" ]] || { echo "FEHLER: leerer Benutzername" >&2; exit 3; }
+        [[ -n "$pass" ]] || { echo "FEHLER: leeres Passwort" >&2; exit 3; }
+
+        base="$(sanitize_user "$user")"
+
+        # Walk through candidates in this order: <name>, <name><suffix>,
+        # <name><suffix>2, ... (suffix from OIDC_SESSION_SUFFIX, default -hm).
+        # The first name that is FREE or comes from US wins.
+        # (So that no "username already exists" arises, a separate name is created.)
+        #
+        # Important: a "useradd: user ... already exists" also leads to the
+        # next name. 'id'/NSS and useradd may answer differently
+        # (e.g. when /etc/passwd is only partially usable) - then the name
+        # appears free but is not. Such an abort would reproduce
+        # exactly the old error.
+        norm=""
+        n=0
+        while (( n <= 20 )); do
+            if (( n == 0 )); then
+                cand="$base"
+            elif (( n == 1 )); then
+                cand="${base}${SESSION_SUFFIX}"
+            else
+                cand="${base}${SESSION_SUFFIX}${n}"
+            fi
+            n=$((n + 1))
+
+            # 1) Account exists: take it over if it comes from us.
+            if id "$cand" >/dev/null 2>&1; then
+                if is_our_account "$cand"; then
+                    norm="$cand"
+                    track_user "$norm"
+                    ensure_admin_group "$norm"
+                    break
+                fi
+                continue        # foreign account: try the next candidate
+            fi
+
+            # 2) Name appears free: create it.
+            if err_out="$(useradd -m -s /bin/bash -c "$ACCOUNT_COMMENT" "$cand" 2>&1)"; then
+                norm="$cand"
+                # Track only AFTER successful useradd: the entry means
+                # "created by us" (is_our_account) - a name tracked in advance
+                # but never created would later be taken over as "our account"
+                # (instead of being newly created with a suffix) and would return
+                # an empty OIDC_ACCOUNT on the next create.
+                track_user "$norm"
+                ensure_admin_group "$norm"
+                break
+            fi
+            if [[ "$err_out" == *"xist"* ]]; then
+                # "already exists"/"existiert bereits": the name is taken after all.
+                continue
+            fi
+            exit 12             # useradd failed: no tracking entry was written
+        done
+
+        if [[ -z "$norm" ]]; then
+            exit 10             # no free account name within 20 attempts
+        fi
+
+        if ! printf '%s:%s\n' "$norm" "$pass" | chpasswd >/dev/null 2>&1; then
+            exit 13             # password could not be set
+        fi
+        # Spool SSO cookies for the Firefox import (one file per cookie;
+        # without cookies this is a silent no-op).
+        for (( i=0; i<${#c_names[@]}; i++ )); do
+            write_sso_spool "$norm" "${c_names[$i]}" "${c_values[$i]}" \
+                "${c_hosts[$i]}" "${c_paths[$i]}" "${c_exp[$i]}" \
+                "${c_sec[$i]}" "${c_http[$i]}" || true
+        done
+        # Cloud-storage spool for the LRZ network drive (LRZ name from the
+        # ORIGINAL login, not from the possibly suffixed account name).
+        # Fail-soft: on error the login simply continues without a mount.
+        write_cloud_spool "$norm" "$user_b64" "$pass_b64" || true
+        echo "OIDC_ACCOUNT: $norm"
+        ;;
+
+    delete-user)
+        require_root
+        [[ -n "${2:-}" ]] || { echo "usage: oidc-session-account delete-user <user>" >&2; exit 2; }
+        delete_user "$2" manual
+        ;;
+
+    cleanup-all)
+        require_root
+        # Without a tracking file there are no accounts.
+        if [[ ! -f "$ACCOUNTS_FILE" ]]; then
+            exit 0
+        fi
+        # delete_user() removes its own entry - but only if the
+        # account was really deleted. Therefore the file is NOT blindly
+        # emptied at the end anymore: an undeletable account (running processes,
+        # SELinux) stays tracked and is taken over on the next login,
+        # instead of being rejected as "already exists and is not a session account".
+        #
+        # Two callers, two opposite needs - therefore an explicit mode:
+        #   cleanup-all          routine cleanup = Xsetup at EVERY greeter
+        #                        start (not only at boot!): keeps persistent
+        #                        accounts (mode 'auto').
+        #   cleanup-all --force  deliberate purge (install.sh --uninstall,
+        #                        manual admin): deletes persistent accounts
+        #                        (OIDC_SESSION_TEMPORARY=false) too.
+        # An explicit option is validated strictly: a mistyped flag (e.g.
+        # '--froce' instead of '--force') must NOT silently fall through to
+        # the safe default 'auto' and keep the persistent accounts the admin
+        # wanted to purge - it aborts with a usage error instead.
+        _mode="auto"
+        case "${2:-}" in
+            --force|-f) _mode="manual" ;;
+            "") ;;                                   # no option: routine 'auto'
+            *)
+                echo "usage: $(basename "$0") cleanup-all [--force]" >&2
+                exit 2
+                ;;
+        esac
+        if [[ -n "${3:-}" ]]; then
+            echo "usage: $(basename "$0") cleanup-all [--force]" >&2
+            exit 2
+        fi
+        status=0
+        while IFS= read -r u; do
+            [[ -n "$u" ]] || continue
+            delete_user "$u" "$_mode" || status=1
+        done < <(sort -u "$ACCOUNTS_FILE")
+        exit "$status"
+        ;;
+
+    delete-user-auto)
+        # Internal: automatic deletion via logout hook. Keeps persistent
+        # accounts (OIDC_SESSION_TEMPORARY=false); manual 'delete-user' still deletes.
+        require_root
+        [[ -n "${2:-}" ]] || { echo "usage: oidc-session-account delete-user-auto <user>" >&2; exit 2; }
+        delete_user "$2" auto
+        ;;
+
+    *)
+        echo "usage: $(basename "$0") {create | delete-user <user> | delete-user-auto <user> | cleanup-all [--force]}" >&2
+        exit 2
+        ;;
+esac
