@@ -87,6 +87,7 @@ Rectangle {
   // ---- Win11 look (Qt5/Qt6 compatible, no QtQuick.Effects) ----
   // Accent + glass tints.
   property color accentColor: config.accentColor ? config.accentColor : accentShade
+  property color accentHMColor: config.accentHMColor ? config.accentHMColor : accentShade
   property color backgroundColor: config.backgroundColor ? config.backgroundColor : defaultBg
   property color textColor: config.textColor ? config.textColor : normalText
   readonly property string uiFontFamily: config.fontFamily ? config.fontFamily : ""
@@ -873,7 +874,7 @@ Rectangle {
       spacing: 10
       SpButton {
         id: maya_reboot
-        width: 130
+        width: 150
         height: 44
         enabled: (sddm.canReboot === true)
         icon: Qt.resolvedUrl("images/ic_refresh_white_24px.svg")
@@ -886,7 +887,7 @@ Rectangle {
       }
       SpButton {
         id: maya_power
-        width: 130
+        width: 150
         height: 44
         enabled: (sddm.canPowerOff === true)
         icon: Qt.resolvedUrl("images/ic_power_settings_new_white_24px.svg")
@@ -1053,7 +1054,7 @@ Rectangle {
           height: 38
           enabled: !(maya_root.hmLoginProcess && maya_root.hmLoginProcess.running)
           text: maya_root.hmLoginLabel
-          color: Qt.rgba(1,1,1,0.10)
+          color: accentHMColor
           textColor: textColor
           borderColor: Qt.rgba(1,1,1,0.18)
           pressedColor: Qt.rgba(1,1,1,0.05)
