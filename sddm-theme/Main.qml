@@ -873,7 +873,7 @@ Rectangle {
       spacing: 10
       SpButton {
         id: maya_reboot
-        width: 130
+        width: 150
         height: 44
         enabled: (sddm.canReboot === true)
         icon: Qt.resolvedUrl("images/ic_refresh_white_24px.svg")
@@ -886,7 +886,7 @@ Rectangle {
       }
       SpButton {
         id: maya_power
-        width: 130
+        width: 150
         height: 44
         enabled: (sddm.canPowerOff === true)
         icon: Qt.resolvedUrl("images/ic_power_settings_new_white_24px.svg")
